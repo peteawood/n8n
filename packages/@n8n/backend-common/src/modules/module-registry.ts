@@ -46,6 +46,9 @@ export class ModuleRegistry {
 		'ldap',
 		'quick-connect',
 		'workflow-builder',
+		'redaction',
+		'instance-registry',
+		'otel',
 	];
 
 	private readonly activeModules: string[] = [];

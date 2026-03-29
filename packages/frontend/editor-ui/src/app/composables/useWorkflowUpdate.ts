@@ -6,10 +6,16 @@
 import { DEFAULT_NEW_WORKFLOW_NAME } from '@/app/constants';
 import type { INodeUi } from '@/Interface';
 import { useWorkflowsStore } from '@/app/stores/workflows.store';
+import {
+	useWorkflowDocumentStore,
+	createWorkflowDocumentId,
+} from '@/app/stores/workflowDocument.store';
 import { useCredentialsStore } from '@/features/credentials/credentials.store';
 import { useNodeTypesStore } from '@/app/stores/nodeTypes.store';
 import { useBuilderStore } from '@/features/ai/assistant/builder.store';
+import { useUIStore } from '@/app/stores/ui.store';
 import { injectWorkflowState } from '@/app/composables/useWorkflowState';
+import { computed } from 'vue';
 import { useCanvasOperations } from '@/app/composables/useCanvasOperations';
 import { useNodeHelpers } from '@/app/composables/useNodeHelpers';
 import { canvasEventBus } from '@/features/workflows/canvas/canvas.eventBus';
@@ -42,8 +48,15 @@ export function useWorkflowUpdate() {
 	const credentialsStore = useCredentialsStore();
 	const nodeTypesStore = useNodeTypesStore();
 	const builderStore = useBuilderStore();
+	const uiStore = useUIStore();
 	const canvasOperations = useCanvasOperations();
 	const nodeHelpers = useNodeHelpers();
+
+	const workflowDocumentStore = computed(() =>
+		workflowsStore.workflowId
+			? useWorkflowDocumentStore(createWorkflowDocumentId(workflowsStore.workflowId))
+			: undefined,
+	);
 
 	/**
 	 * Categorize nodes into those to update, add, or remove.
@@ -55,12 +68,11 @@ export function useWorkflowUpdate() {
 	 * triggering maxNodes validation errors for nodes like ChatTrigger.
 	 */
 	function categorizeNodes(workflowData: WorkflowDataUpdate) {
-		const existingNodesById = new Map(workflowsStore.allNodes.map((n) => [n.id, n]));
+		const allNodes = workflowDocumentStore.value?.allNodes ?? [];
+		const existingNodesById = new Map(allNodes.map((n) => [n.id, n]));
 
 		// Add name+type index for fallback matching when IDs differ
-		const existingNodesByNameType = new Map(
-			workflowsStore.allNodes.map((n) => [`${n.type}::${n.name}`, n]),
-		);
+		const existingNodesByNameType = new Map(allNodes.map((n) => [`${n.type}::${n.name}`, n]));
 
 		const nodesToUpdate: Array<{ existing: INodeUi; updated: INode }> = [];
 		const nodesToAdd: INode[] = [];
@@ -105,11 +117,12 @@ export function useWorkflowUpdate() {
 	 */
 	async function updateExistingNodes(
 		nodesToUpdate: Array<{ existing: INodeUi; updated: INode }>,
-	): Promise<void> {
-		if (nodesToUpdate.length === 0) return;
+	): Promise<boolean> {
+		if (nodesToUpdate.length === 0) return false;
 
 		// Track successful renames (nodeId -> actualNewName after uniquification)
 		const renamedNodes = new Map<string, string>();
+		let hasChanges = false;
 
 		// First handle renames via canvasOperations (handles pinData, metadata, etc.)
 		for (const { existing, updated } of nodesToUpdate) {
@@ -121,6 +134,7 @@ export function useWorkflowUpdate() {
 				});
 				if (actualNewName) {
 					renamedNodes.set(existing.id, actualNewName);
+					hasChanges = true;
 				}
 			}
 		}
@@ -158,18 +172,21 @@ export function useWorkflowUpdate() {
 
 			// Mark node as dirty if parameters changed
 			if (!isEqual(existing.parameters, updated.parameters)) {
-				workflowState.resetParametersLastUpdatedAt(nodeName);
+				workflowDocumentStore.value?.resetParametersLastUpdatedAt(nodeName);
+				hasChanges = true;
 			}
 		}
 
 		// Sync state back to store
-		workflowsStore.setNodes(Object.values(workflow.nodes));
-		workflowsStore.setConnections(workflow.connectionsBySourceNode);
+		workflowDocumentStore.value?.setNodes(Object.values(workflow.nodes));
+		workflowDocumentStore.value?.setConnections(workflow.connectionsBySourceNode);
 		// Revalidate updated nodes to refresh error indicators on canvas
 		for (const { existing } of nodesToUpdate) {
 			const nodeName = renamedNodes.get(existing.id) ?? existing.name;
 			nodeHelpers.updateNodeParameterIssuesByName(nodeName);
 		}
+
+		return hasChanges;
 	}
 
 	/**
@@ -229,17 +246,15 @@ export function useWorkflowUpdate() {
 	 * Update connections - remove old, add new
 	 */
 	async function updateConnections(newConnections: IConnections): Promise<void> {
-		const existingConnections = workflowsStore.workflow.connections;
+		const existingConnections = workflowDocumentStore.value?.connectionsBySourceNode ?? {};
 
 		// Convert to canvas format for comparison
+		const allNodes = workflowDocumentStore.value?.allNodes ?? [];
 		const existingCanvasConnections = mapLegacyConnectionsToCanvasConnections(
 			existingConnections,
-			workflowsStore.allNodes,
+			allNodes,
 		);
-		const newCanvasConnections = mapLegacyConnectionsToCanvasConnections(
-			newConnections,
-			workflowsStore.allNodes,
-		);
+		const newCanvasConnections = mapLegacyConnectionsToCanvasConnections(newConnections, allNodes);
 
 		// Find connections to remove (exist in current but not in new)
 		const connectionsToRemove = existingCanvasConnections.filter(
@@ -346,7 +361,15 @@ export function useWorkflowUpdate() {
 
 			const { nodesToUpdate, nodesToAdd, nodesToRemove } = categorizeNodes(workflowData);
 
-			await updateExistingNodes(nodesToUpdate);
+			const existingNodesChanged = await updateExistingNodes(nodesToUpdate);
+
+			// Mark state dirty when existing nodes are modified (e.g., parameter changes).
+			// addNewNodes/removeStaleNodes already mark dirty via canvasOperations,
+			// but updateExistingNodes uses setNodes() which does not.
+			if (existingNodesChanged) {
+				uiStore.markStateDirty();
+			}
+
 			removeStaleNodes(nodesToRemove);
 			const addedNodes = await addNewNodes(nodesToAdd);
 			const newNodeIds = addedNodes.map((n) => n.id);
@@ -354,19 +377,16 @@ export function useWorkflowUpdate() {
 			updateWorkflowNameIfNeeded(workflowData.name, options?.isInitialGeneration);
 
 			// Merge pin data from workflow data with existing pin data
-			if (workflowData.pinData) {
-				workflowsStore.setWorkflowPinData({
-					...workflowsStore.workflow.pinData,
+			if (workflowData.pinData && workflowDocumentStore.value) {
+				workflowDocumentStore.value.setPinData({
+					...workflowDocumentStore.value.getPinDataSnapshot(),
 					...workflowData.pinData,
 				});
 			}
 
 			builderStore.setBuilderMadeEdits(true);
 
-			const hasStructuralChanges = nodesToAdd.length > 0 || nodesToRemove.length > 0;
-			if (hasStructuralChanges) {
-				tidyUpNodes();
-			}
+			tidyUpNodes();
 
 			return { success: true, newNodeIds };
 		} catch (error) {

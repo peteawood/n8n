@@ -41,7 +41,7 @@ export function getPhaseEntry(
 	log: CoordinationLogEntry[],
 	phase: SubgraphPhase,
 ): CoordinationLogEntry | null {
-	return log.find((entry) => entry.phase === phase && entry.status === 'completed') ?? null;
+	return log.findLast((entry) => entry.phase === phase && entry.status === 'completed') ?? null;
 }
 
 /**
@@ -183,6 +183,23 @@ export function getNextPhaseFromLog(log: CoordinationLogEntry[]): RoutingDecisio
 
 	// No phases completed yet → let supervisor decide
 	return 'responder';
+}
+
+/**
+ * Get entries from the current turn only.
+ * A turn ends when the responder completes, so current-turn entries
+ * are those after the last completed responder entry.
+ * This prevents stale entries from previous turns leaking into context.
+ */
+export function getCurrentTurnEntries(log: CoordinationLogEntry[]): CoordinationLogEntry[] {
+	const lastResponderIndex = log.findLastIndex(
+		(entry) => entry.phase === 'responder' && entry.status === 'completed',
+	);
+
+	// No previous responder completion — entire log is the current turn
+	if (lastResponderIndex === -1) return log;
+
+	return log.slice(lastResponderIndex + 1);
 }
 
 /**

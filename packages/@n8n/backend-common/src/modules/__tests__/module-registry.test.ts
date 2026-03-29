@@ -36,6 +36,9 @@ describe('eligibleModules', () => {
 			'ldap',
 			'quick-connect',
 			'workflow-builder',
+			'redaction',
+			'instance-registry',
+			'otel',
 		]);
 	});
 
@@ -58,6 +61,9 @@ describe('eligibleModules', () => {
 			'ldap',
 			'quick-connect',
 			'workflow-builder',
+			'redaction',
+			'instance-registry',
+			'otel',
 		]);
 	});
 
